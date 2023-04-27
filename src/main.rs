@@ -19,6 +19,10 @@ fn main() -> Result<()> {
     let out = ctx.relu(&f)?;
     let out = ctx.soft_max(&out)?;
 
+    // let weights = ctx.new_tensor_2dim(TensorType::F32, 2, 3)?;
+    // let bias = ctx.new_tensor_2dim(TensorType::F32, 2, 4)?;
+    let out = ctx.matrix_mul(&a, &b)?;
+
     // Build the forward graph
     let graph = ctx.build_forward(&out)?;
 
@@ -30,7 +34,7 @@ fn main() -> Result<()> {
     // ctx.dump_dot(&mut graph);
     // ctx.print_graph(&graph);
 
-    for _ in 0..0x1fffff {
+    for _ in 0..0x1fff {
         ctx.compute_forward(&graph)?;
     }
 

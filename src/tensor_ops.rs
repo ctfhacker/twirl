@@ -1,6 +1,6 @@
 use core::simd::{LaneCount, Simd, SupportedLaneCount};
 use std::ops::{Add, Mul};
-use std::simd::SimdFloat;
+use std::simd::{SimdFloat, StdFloat};
 
 use eyre::Result;
 
@@ -68,10 +68,13 @@ macro_rules! impl_operation_2ops {
                     self.datas[node], self.datas[first_op], stringify!($operation), self.datas[second_op]
                 );
 
+                // Perform the actual computation for this operation
                 #[cfg(feature = "avx512")]
-                work::<16>(self, [node, &first_op, &second_op]);
+                const LANES: usize = 16;
                 #[cfg(not(feature = "avx512"))]
-                work::<8>(self, [node, &first_op, &second_op]);
+                const LANES: usize = 8;
+
+                work::<LANES>(self, [node, &first_op, &second_op]);
 
                 log::debug!(
                     "After  {:?} = {:?} {} {:?}",
@@ -217,3 +220,143 @@ where
         .for_each(|x| *x /= sum);
 }
 impl_operation_1op!(compute_forward_softmax, softmax_work);
+
+fn transmute(data: &[f32], data_dims: &[usize; 2]) -> (Vec<f32>, [usize; 2]) {
+    let mut result = vec![0.0; data_dims.iter().product()];
+    let [rows, cols] = *data_dims;
+
+    // Perform the basic transmute
+    for row in 0..rows {
+        for col in 0..cols {
+            result[col * rows + row] = data[row * cols + col];
+        }
+    }
+
+    (result, [cols, rows])
+}
+
+impl Context {
+    /// Compute the multiplication for this tensor
+    pub fn compute_forward_matrix_mul(&mut self, node: &TensorId) -> Result<()> {
+        // Get the first operand
+        let Some(first_op) = self.first_op(node) else {
+            return Err(TensorError::FirstOperandNeededForOp { tensor: *node, operation: TensorOp::MatrixMul}.into());
+        };
+
+        // Get the second operand
+        let Some(second_op) = self.second_op(node) else {
+            return Err(TensorError::SecondOperandNeededForOp { tensor: *node, operation: TensorOp::MatrixMul}.into());
+        };
+
+        let dest_type_name = self.type_name(node);
+        let op1_type_name = self.type_name(&first_op);
+        let op2_type_name = self.type_name(&second_op);
+
+        assert!(
+            dest_type_name == "f32",
+            "Only can matrix mul by f32 for now"
+        );
+        assert!(dest_type_name == op1_type_name);
+        assert!(dest_type_name == op2_type_name);
+
+        fn work<const LANES: usize>(ctx: &mut Context, operands: [&TensorId; 3])
+        where
+            LaneCount<LANES>: SupportedLaneCount,
+        {
+            let [dest, op1, op2] = operands;
+
+            let arg1_dims = ctx.dimensions(op1);
+            let arg2_dims = ctx.dimensions(op2);
+            let sum_dims = ctx.dimensions(dest);
+
+            // Get the dimensions for the operands and destination
+            let [arg1_rows, arg1_cols, ..] = arg1_dims;
+            let [arg2_rows, arg2_cols, ..] = arg2_dims;
+            let [sum_rows, sum_cols, ..] = sum_dims;
+
+            println!("Dims before: {arg2_rows} x {arg2_cols}");
+
+            println!("TODO DO THIS MATRIX TRANSMUTE ELSEWHERE");
+            let (arg2, [arg2_rows, arg2_cols]) =
+                transmute(ctx.datas[op2].get_f32_slice(), &[arg2_rows, arg2_cols]);
+
+            println!("Dims after:  {arg2_rows} x {arg2_cols}");
+
+            assert!(arg1_cols == arg2_cols);
+            assert!(sum_rows == arg1_rows);
+            assert!(
+                sum_cols == arg2_rows,
+                "sum cols {sum_cols} arg2_rows {arg2_rows}"
+            );
+
+            for row in 0..arg1_rows {
+                for col in 0..arg2_rows {
+                    let mut curr_sum = Simd::<f32, LANES>::splat(0.0);
+
+                    // Get the data slices for the operands
+                    let arg1 = ctx.datas[op1].get_f32_slice();
+                    // let arg2 = ctx.datas[op2].get_f32_slice();
+
+                    let mut index = 0;
+                    loop {
+                        if (arg1_cols - index) < LANES {
+                            break;
+                        }
+
+                        let a1 = Simd::<f32, LANES>::from_slice(&arg1[row * arg1_cols + index..]);
+                        let b1 = Simd::<f32, LANES>::from_slice(&arg2[col * arg2_cols + index..]);
+
+                        // Perform the sum += a * b;
+                        curr_sum = a1.mul_add(b1, curr_sum);
+
+                        index += LANES;
+                    }
+
+                    // Sum the current elements
+                    let mut curr_sum = curr_sum.reduce_sum();
+
+                    // Add the remaining elements that could not fit in the SIMD lanes
+                    for i in index..arg1_cols {
+                        let a = arg1[row * arg1_cols + i];
+                        let b = arg2[col * arg2_cols + i];
+                        curr_sum += a * b;
+                    }
+
+                    // Write the sum into the current element
+                    let mut sum = ctx.datas[dest].get_f32_slice_mut();
+                    sum[row * sum_cols + col] = curr_sum;
+                }
+            }
+        }
+
+        log::debug!(
+            "Before {:?} = {:?} {} {:?}",
+            self.datas[node],
+            self.datas[first_op],
+            stringify!($operation),
+            self.datas[second_op]
+        );
+
+        let start = std::time::Instant::now();
+
+        println!("START MATRIX MUL");
+
+        // Perform the actual computation for this operation
+        #[cfg(feature = "avx512")]
+        work::<16>(self, [node, &first_op, &second_op]);
+        #[cfg(not(feature = "avx512"))]
+        work::<8>(self, [node, &first_op, &second_op]);
+
+        println!("Elapsed: {:?}", start.elapsed());
+
+        log::debug!(
+            "After  {:?} = {:?} {} {:?}",
+            self.datas[node],
+            self.datas[first_op],
+            stringify!($operation),
+            self.datas[second_op]
+        );
+
+        Ok(())
+    }
+}

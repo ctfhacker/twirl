@@ -147,4 +147,105 @@ mod tests {
         vec![-1.0, 0.0, 3.0, 5.0],
         vec![0.002, 0.006, 0.118, 0.874]
     );
+
+    #[test]
+    fn test_matrix_mul() -> eyre::Result<()> {
+        use rand::Rng;
+
+        // Create the context to create tensors and the graph
+        let mut ctx = Context::new(64);
+        let mut rng = rand::thread_rng();
+
+        let rows = 16 * 20 + 2;
+        let cols = 16 * 20 + 7;
+
+        // Initialize the first operand
+        let arg1_data = vec![rng.gen_range(-1.0..1.0); rows * cols];
+        let arg1 = ctx
+            .new_tensor_2dim_data(rows, cols, TensorData::F32(arg1_data.clone()))
+            .unwrap();
+
+        let arg2_data = vec![rng.gen_range(-1.0..1.0); rows * cols];
+        let arg2 = ctx
+            .new_tensor_2dim_data(cols, rows, TensorData::F32(arg2_data.clone()))
+            .unwrap();
+
+        // Add a mul operation
+        let out = ctx.matrix_mul(&arg1, &arg2).unwrap();
+
+        // Build the forward graph
+        let graph = ctx.build_forward(&out)?;
+
+        // Calculate the forward pass
+        ctx.compute_forward(&graph)?;
+
+        // Call the easy, naive result to check the result
+        let mut naive_result = vec![rng.gen_range(-1.0..1.0); rows * rows];
+        naive_matrix_mul(
+            &mut naive_result,
+            &[rows, rows],
+            &arg1_data,
+            &[rows, cols],
+            &arg2_data,
+            &[cols, rows],
+        );
+
+        // Confirm the results
+        let data = ctx.datas[out].get_f32_slice();
+
+        const ERROR: f32 = 0.01;
+        assert!(
+            data.iter()
+                .zip(naive_result.iter())
+                .map(|(x, y)| (x - y).abs())
+                .all(|x| x <= ERROR),
+            "Errors: {:?}",
+            data.iter()
+                .zip(naive_result.iter())
+                .map(|(x, y)| (x - y).abs())
+                .filter(|x| x >= &ERROR)
+                .collect::<Vec<_>>()
+        );
+
+        Ok(())
+    }
+}
+
+pub fn naive_matrix_mul(
+    sum: &mut [f32],
+    sum_dims: &[usize; 2],
+    arg1: &[f32],
+    arg1_dims: &[usize; 2],
+    arg2: &[f32],
+    arg2_dims: &[usize; 2],
+) {
+    let [arg1_rows, arg1_cols] = arg1_dims.clone();
+    assert!(arg1.len() == arg1_rows * arg1_cols);
+
+    let [arg2_rows, arg2_cols] = arg2_dims.clone();
+    assert!(
+        arg2.len() == arg2_rows * arg2_cols,
+        "{} != {}",
+        arg2.len(),
+        arg2_rows * arg2_cols
+    );
+
+    let [sum_rows, sum_cols] = sum_dims.clone();
+    assert!(sum.len() == sum_rows * sum_cols);
+
+    assert!(arg1_cols == arg2_rows);
+    assert!(sum_rows == arg1_rows);
+    assert!(sum_cols == arg2_cols);
+
+    for row in 0..arg1_rows {
+        for col in 0..arg2_cols {
+            let mut curr_sum = 0.0;
+
+            for index in 0..arg1_cols {
+                curr_sum += arg1[row * arg1_cols + index] * arg2[arg2_cols * index + col];
+            }
+
+            sum[row * sum_cols + col] = curr_sum;
+        }
+    }
 }

@@ -62,6 +62,20 @@ pub enum TensorError {
         operation: TensorOp,
     },
 
+    /// These tensors do not have the correct dimensions to be multiplied
+    CannotMultiplyTheseTensors {
+        op1: TensorId,
+        op1_dims: [usize; MAX_DIMENSIONS],
+        op2: TensorId,
+        op2_dims: [usize; MAX_DIMENSIONS],
+    },
+
+    /// This tensor is transposed and cannot be multiplied
+    CannotMultiplyTransposedTensor {
+        op1: TensorId,
+        bytes_per_dimension: [usize; MAX_DIMENSIONS],
+    },
+
     Io(std::io::Error),
 }
 
@@ -118,7 +132,7 @@ impl_index_for_tensor_id!(TensorData);
 impl_index_for_tensor_id!(Option<TensorData>);
 
 /// The type for the given tensor
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TensorType {
     F32,
     F16,
@@ -182,6 +196,9 @@ pub enum TensorOpResult {
 
     /// Store the result in place of the first operand tensor
     InPlace,
+
+    /// Use the given custom tensor as the result tensor
+    Custom(TensorId),
 }
 
 #[derive(Debug)]
@@ -247,14 +264,14 @@ pub struct Context {
     /// The number of elements in each dimension for this tensor at this index
     pub dimensions: Vec<[usize; MAX_DIMENSIONS]>,
 
-    /// The stride, in bytes, to reach the given dimension in this tensor
+    /// The number of bytes to reach the given dimension in this tensor
     ///
     /// From ggml:
     ///
     /// stride[0] = sizeof(type)
     /// stride[1] = stride[0] * number_of_elements[0] + padding
     /// stride[i] = stride[i - 1] * number_of_elements[i - 1] + padding
-    pub strides: Vec<[usize; MAX_DIMENSIONS]>,
+    pub bytes_per_dimensions: Vec<[usize; MAX_DIMENSIONS]>,
 
     /// The [`TensorId`] holding the gradient for this tensor
     pub gradients: Vec<Option<TensorId>>,
@@ -305,7 +322,7 @@ impl Context {
             tensor_types: Vec::with_capacity(num_init_tensors),
             number_of_dimensions: Vec::with_capacity(num_init_tensors),
             dimensions: Vec::with_capacity(num_init_tensors),
-            strides: Vec::with_capacity(num_init_tensors),
+            bytes_per_dimensions: Vec::with_capacity(num_init_tensors),
             gradients: Vec::with_capacity(num_init_tensors),
             first_ops: Vec::with_capacity(num_init_tensors),
             second_ops: Vec::with_capacity(num_init_tensors),
@@ -359,7 +376,7 @@ impl Context {
             tensor_types,
             number_of_dimensions,
             dimensions,
-            strides,
+            bytes_per_dimensions,
             gradients,
             first_ops,
             second_ops,
@@ -372,7 +389,7 @@ impl Context {
         assert!(operations.len() == tensor_types.len());
         assert!(operations.len() == number_of_dimensions.len());
         assert!(operations.len() == dimensions.len());
-        assert!(operations.len() == strides.len());
+        assert!(operations.len() == bytes_per_dimensions.len());
         assert!(operations.len() == gradients.len());
         assert!(operations.len() == first_ops.len());
         assert!(operations.len() == second_ops.len());
@@ -383,7 +400,26 @@ impl Context {
 
     /// Get the number of rows for the given `tensor`
     pub fn number_of_rows(&self, tensor: &TensorId) -> usize {
-        // Number of rows is the product of the dimensions for all layers after the first
+        // Number of rows is the product of the dimensions after the first
+        self.dimensions(tensor)[1..]
+            .iter()
+            .filter(|x| **x > 0)
+            .product::<usize>()
+            .min(1)
+    }
+
+    /// Get the number of elements in the given `tensor`
+    pub fn number_of_elements(&self, tensor: &TensorId) -> usize {
+        // Number of rows is the product of the dimensions
+        self.dimensions(tensor)
+            .iter()
+            .filter(|x| **x > 0)
+            .product::<usize>()
+            .min(1)
+    }
+
+    /// Get the number of bytes in the data for the given `tensor`
+    pub fn data_bytes(&self, tensor: &TensorId) -> usize {
         self.dimensions(tensor)[1..]
             .iter()
             .filter(|x| **x > 0)
@@ -411,9 +447,14 @@ impl Context {
         self.type_names[id]
     }
 
-    /// Get the stride for the tensor with the given [`TensorId`]
+    /// Get the stride for the tensor with the given [`TensorId`] (alias for self.bytes_per_dimension)
     pub fn stride(&self, id: &TensorId) -> [usize; MAX_DIMENSIONS] {
-        self.strides[id]
+        self.bytes_per_dimension(id)
+    }
+
+    /// Get the stride for the tensor with the given [`TensorId`]
+    pub fn bytes_per_dimension(&self, id: &TensorId) -> [usize; MAX_DIMENSIONS] {
+        self.bytes_per_dimensions[id]
     }
 
     /// Get the number of dimensions for the tensor with the given [`TensorId`]
@@ -472,10 +513,39 @@ impl Context {
         self._new_tensor_ndim(tensor_type, 1, dims, None)
     }
 
+    /// Create a new 2-dimensional tensor of the given `type` with the given number of elements
+    pub fn new_tensor_2dim(
+        &mut self,
+        tensor_type: TensorType,
+        rows: usize,
+        cols: usize,
+    ) -> Result<TensorId> {
+        let mut dims = [0; MAX_DIMENSIONS];
+        dims[0] = rows;
+        dims[1] = cols;
+        self._new_tensor_ndim(tensor_type, 2, dims, None)
+    }
+
     /// Create a new 1-dimensional tensor of the given `type` with the given number of elements
     pub fn new_tensor_1dim_data(&mut self, data: TensorData) -> Result<TensorId> {
         let mut dims = [0; MAX_DIMENSIONS];
         dims[0] = data.len();
+        let tensor_type = data.tensor_type();
+        self._new_tensor_ndim(tensor_type, 1, dims, Some(data))
+    }
+
+    /// Create a new 1-dimensional tensor of the given `type` with the given number of elements
+    pub fn new_tensor_2dim_data(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        data: TensorData,
+    ) -> Result<TensorId> {
+        let mut dims = [0; MAX_DIMENSIONS];
+        dims[0] = rows;
+        dims[1] = cols;
+        let len = data.len();
+        assert!(data.len() == rows * cols);
         let tensor_type = data.tensor_type();
         self._new_tensor_ndim(tensor_type, 1, dims, Some(data))
     }
@@ -509,6 +579,19 @@ impl Context {
             }
         };
 
+        /*
+        /// Create a column major transmute for 2d arrays to enable the use of a column major
+        /// tensor for matrix multiplication
+        let column_major = match tensor_number_of_dimensions {
+            2 => {
+                let mut col_major = Vec::new();
+
+                Some()
+            }
+            _ => None
+        }
+        */
+
         println!("Tensor type: {tensor_type:?} Len: {}", data.len());
 
         let Context {
@@ -521,7 +604,7 @@ impl Context {
             tensor_types,
             number_of_dimensions,
             dimensions,
-            strides,
+            bytes_per_dimensions,
             gradients,
             first_ops,
             second_ops,
@@ -539,8 +622,8 @@ impl Context {
         }
 
         // The first stride is always only the size of the element
-        let mut stride = [0; MAX_DIMENSIONS];
-        stride[0] = tensor_type.size();
+        let mut bytes_per_dimension = [0; MAX_DIMENSIONS];
+        bytes_per_dimension[0] = tensor_type.size();
 
         if tensor_dimensions[0] == 0 {
             return Err(TensorError::TensorWithNoFirstDimension.into());
@@ -548,12 +631,12 @@ impl Context {
 
         // Calculate the stride for the first dimension
         let first_dim = tensor_dimensions[0];
-        stride[1] = tensor_type.size() * (first_dim / tensor_type.block_size());
+        bytes_per_dimension[1] = tensor_type.size() * (first_dim / tensor_type.block_size());
 
         // Calculate the stride for the remaining dimensions
         for i in 2..(tensor_number_of_dimensions.saturating_sub(1) as usize) {
             let prev_dim = tensor_dimensions[i - 1];
-            stride[i] = stride[i - 1] * prev_dim;
+            bytes_per_dimension[i] = bytes_per_dimension[i - 1] * prev_dim;
         }
 
         // Allocate a default tensor
@@ -567,7 +650,7 @@ impl Context {
             push!(first_ops, None);
             push!(second_ops, None);
             push!(datas, data);
-            push!(strides, stride);
+            push!(bytes_per_dimensions, bytes_per_dimension);
             push!(is_root_nodes, false);
             push!(type_names, tensor_type.name());
         }
@@ -640,6 +723,64 @@ impl Context {
         self._tensor_operation(TensorOp::SoftMax, TensorOpResult::NewTensor, op1, None)
     }
 
+    /// Multiply the matrix operands `op1` and `op2` and return the resulting tensor
+    pub fn matrix_mul(&mut self, op1: &TensorId, op2: &TensorId) -> Result<TensorId> {
+        /*
+        let op1_dims = self.dimensions(op1);
+        let op2_dims = self.dimensions(op2);
+
+        let mut valid = op1_dims[0] == op2_dims[0];
+        for index in 2..MAX_DIMENSIONS {
+            if valid {
+                valid = op1_dims[index] == op2_dims[index];
+            }
+        }
+
+        // Ensure these tensors can be multiplied together
+        if !valid {
+            return Err(TensorError::CannotMultiplyTheseTensors {
+                op1: *op1,
+                op1_dims,
+                op2: *op2,
+                op2_dims,
+            }
+            .into());
+        }
+        */
+
+        /*
+        // If the matrix is transposed, it cannot be multipled
+        let bytes_per_dimension = self.bytes_per_dimension(op1);
+        if bytes_per_dimension[0] > bytes_per_dimension[1] {
+            return Err(TensorError::CannotMultiplyTransposedTensor {
+                op1: *op1,
+                bytes_per_dimension,
+            }
+            .into());
+        }
+        */
+
+        let [op1_rows, op1_cols, no1, no2] = self.dimensions(op1);
+        let [op2_rows, op2_cols, no3, no4] = self.dimensions(op2);
+        assert!(self.tensor_type(op1) == TensorType::F32);
+        assert!(self.tensor_type(op2) == TensorType::F32);
+
+        println!("{op1_rows} x {op1_cols} | {op2_rows} x {op2_cols}");
+
+        if no1 > 0 || no2 > 0 || no3 > 0 || no4 > 0 {
+            panic!("Cannot multiply larger than 2x2 matrices yet");
+        }
+
+        let dest_tensor = self.new_tensor_2dim(TensorType::F32, op1_rows, op2_cols)?;
+
+        self._tensor_operation(
+            TensorOp::MatrixMul,
+            TensorOpResult::Custom(dest_tensor),
+            op1,
+            Some(op2),
+        )
+    }
+
     /// Create the given tensor operation using the operands for this tensor
     pub fn _tensor_operation(
         &mut self,
@@ -663,6 +804,7 @@ impl Context {
         let result = match dest {
             TensorOpResult::InPlace => self.view_tensor(op1)?,
             TensorOpResult::NewTensor => self.duplicate(op1)?,
+            TensorOpResult::Custom(result) => result,
         };
 
         let gradient = if is_node {
@@ -954,6 +1096,7 @@ impl Context {
                 TensorOp::Add => self.compute_forward_add(node)?,
                 TensorOp::Relu => self.compute_forward_relu(node)?,
                 TensorOp::SoftMax => self.compute_forward_softmax(node)?,
+                TensorOp::MatrixMul => self.compute_forward_matrix_mul(node)?,
                 _ => unimplemented!("{op:?}"),
             }
 
@@ -1000,6 +1143,7 @@ pub enum TensorOp {
     Add,
     Relu,
     SoftMax,
+    MatrixMul,
 }
 
 impl From<usize> for TensorOp {
@@ -1010,6 +1154,7 @@ impl From<usize> for TensorOp {
             2 => TensorOp::Add,
             3 => TensorOp::Relu,
             4 => TensorOp::SoftMax,
+            5 => TensorOp::MatrixMul,
             _ => unimplemented!("TensorOp::from({val})"),
         }
     }
